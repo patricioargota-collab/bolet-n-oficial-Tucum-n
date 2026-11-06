@@ -55,11 +55,11 @@ mcp = FastMCP(
 # --------------------------------------------------------------------------- #
 # Helpers HTTP
 # --------------------------------------------------------------------------- #
-async def _get(path: str, params: dict | None = None):
+async def _get(path: str, params: dict | None = None, timeout: httpx.Timeout | None = None):
     url = path if path.startswith("http") else f"{BOLETINES}/{path.lstrip('/')}"
     clean = {k: v for k, v in (params or {}).items() if v not in (None, "", [])}
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT, headers={"User-Agent": UA}) as c:
+        async with httpx.AsyncClient(timeout=timeout or TIMEOUT, headers={"User-Agent": UA}) as c:
             r = await c.get(url, params=clean)
             r.raise_for_status()
             return r.json()
@@ -269,16 +269,27 @@ async def bo_estado() -> str:
     en la linea de ca_estado_indice / tfn_estado de los otros conectores.
     """
     anio = date.today().year
-    data = await _get("", {"ClaseAviso": 2, "Anio": anio, "PageNumber": 1, "PageSize": 1})
-    if isinstance(data, dict) and data.get("_error"):
-        return json.dumps({"disponible": False, **data}, ensure_ascii=False, indent=2)
-    return json.dumps({
+    # Liveness barato: el listado con ClaseAviso+Anio (sin texto) hace un scan pesado en el
+    # backend oficial y tarda 35-45 s o da 500; GetAllTipoAviso responde en <1 s.
+    tipos = await _get("GetAllTipoAviso")
+    if isinstance(tipos, dict) and tipos.get("_error"):
+        return json.dumps({"disponible": False, **tipos}, ensure_ascii=False, indent=2)
+    out = {
         "disponible": True,
         "api_base": API_BASE,
-        "anio_consultado": anio,
-        "legislacion_provincial_en_anio": data.get("totalCount"),
+        "tipos_aviso": len(tipos) if isinstance(tipos, list) else None,
         "_fuente": "https://boletintucuman.gob.ar",
-    }, ensure_ascii=False, indent=2)
+    }
+    # Contador de cobertura: best-effort, con timeout corto (puede fallar si el backend esta lento).
+    data = await _get("", {"ClaseAviso": 2, "Anio": anio, "PageNumber": 1, "PageSize": 1},
+                      timeout=httpx.Timeout(12.0, connect=8.0))
+    if isinstance(data, dict) and not data.get("_error"):
+        out["anio_consultado"] = anio
+        out["legislacion_provincial_en_anio"] = data.get("totalCount")
+    else:
+        out["_nota"] = ("API viva, pero el listado por anio no respondio a tiempo "
+                        "(backend oficial lento/500 en consultas amplias); contador omitido.")
+    return json.dumps(out, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
